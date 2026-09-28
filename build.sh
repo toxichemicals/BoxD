@@ -44,6 +44,7 @@ fi
 if [ -d "slapinroot" ]; then
     echo "[+] Copying ./slapinroot contents into root filesystem..."
     cp -r slapinroot/* initramfs_staging/
+    cp -r slapinroot/.config initramfs_staging
 fi
 
 echo "[+] Packing cpio archive..."
