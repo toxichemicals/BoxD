@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e
-
+# Make sure BoxedOS dir is there
+mkdir -p BoxedOS
+#
 WORK_DIR="BoxedOS"
 IMG="$WORK_DIR/disk.img"
 MNT="$WORK_DIR/esp_mnt"
