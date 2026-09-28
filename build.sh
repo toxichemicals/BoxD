@@ -43,12 +43,11 @@ fi
 # 4. Copy contents of ./slapinroot into the root filesystem loaded at boot
 if [ -d "slapinroot" ]; then
     echo "[+] Copying ./slapinroot contents into root filesystem..."
-<<<<<<< HEAD
-    cp -r slapinroot/* initramfs_staging/
-    cp -r slapinroot/.config initramfs_staging
-=======
+    #cp -r slapinroot/* initramfs_staging/
+    #cp -r slapinroot/.config initramfs_staging
+    # Wasted cycles
+
     cp -r slapinroot/. initramfs_staging/
->>>>>>> dde080b99e577823739052f81b5e895faaed4070
 fi
 
 echo "[+] Packing cpio archive..."
