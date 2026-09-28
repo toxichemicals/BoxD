@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <time.h>
+#include <sys/reboot.h>
 
 #define MAX_SERVICES 128
 #define PORT 209
@@ -48,7 +49,7 @@ char base_dir[256];
 // --- MountD & ReapD ---
 void initialize_mounts() {
     if (getpid() == 1) {
-        printf("[MountD] PID 1 detected. Initializing core virtual filesystems...\n");
+        printf("[MountD] PID 1 detected; Mounting filesystems.\n");
         mkdir("/proc", 0755);
         mkdir("/sys", 0755);
         mkdir("/dev", 0755);
@@ -97,7 +98,7 @@ void* start_reaper(void* arg) {
                 }
                 pthread_mutex_unlock(&services_lock);
             }
-            usleep(100000);
+            // usleep(100000); Might be holding up the system's boot time? Maybe try a value of 10, instead. Off for testing.
         }
     }
     return NULL;
@@ -451,6 +452,7 @@ void* handle_client(void* arg) {
                 "  reload                            - Reload service configurations\n"
                 "  enable [--now] <service>          - Enable a service\n"
                 "  disable [--now] <service>         - Disable a service\n"
+                "  poweroff / shutdown               - Power off the system\n"
                 "  journal <service>                 - View full journal for a service\n"
                 "  journal -t <lines> <service|all>  - Tail journal lines\n"
                 "  journal -h <lines> <service|all>  - Head journal lines\n"
@@ -464,6 +466,24 @@ void* handle_client(void* arg) {
                 char* enabled = services[i].enabled ? "\033[32m[enabled]\033[0m" : "\033[33m[disabled]\033[0m";
                 dprintf(client_fd, " - %s [%s] %s\n", services[i].name, status, enabled);
             }
+        } else if (strcasecmp(argv[0], "poweroff") == 0 || strcasecmp(argv[0], "shutdown") == 0) {
+            dprintf(client_fd, "System is shutting down...\n");
+            
+            // Stop all running services gracefully
+            for (int i = 0; i < service_count; i++) {
+                if (services[i].running) {
+                    stop_service_recursive(&services[i], -1);
+                }
+            }
+
+            // Sync filesystems and power off if PID 1
+            sync();
+            if (getpid() == 1) {
+                reboot(RB_POWER_OFF);
+            } else {
+                system("poweroff");
+            }
+            exit(0);
         } else if (strcasecmp(argv[0], "start") == 0 && argc > 1) {
             char visited[128][128];
             for (int i = 0; i < service_count; i++) {
@@ -623,8 +643,20 @@ int main(int argc, char* argv[]) {
     }
 
     printf("Starting Services:\n");
+
+    // --- Prioritize starting tty1 immediately ---
     for (int i = 0; i < service_count; i++) {
-        if (services[i].enabled && !services[i].running) {
+        if (strcmp(services[i].name, "tty1") == 0 && services[i].enabled && !services[i].running) {
+            char visited[128][128];
+            printf("Starting Primary Console (tty1):\n");
+            start_service_recursive(&services[i], STDOUT_FILENO, visited, 0);
+            break;
+        }
+    }
+
+    // --- Start remaining services ---
+    for (int i = 0; i < service_count; i++) {
+        if (strcmp(services[i].name, "tty1") != 0 && services[i].enabled && !services[i].running) {
             char visited[128][128];
             start_service_recursive(&services[i], STDOUT_FILENO, visited, 0);
         }
