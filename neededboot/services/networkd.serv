@@ -1,0 +1,4 @@
+# NetworkD service configuration for BoxD
+exec=/bin/networkd
+enabled=y
+autorestart=y

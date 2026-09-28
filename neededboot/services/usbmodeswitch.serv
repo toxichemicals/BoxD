@@ -1,0 +1,4 @@
+# USB Mode Switch service configuration for BoxD
+exec=/usr/bin/usb_modeswitch
+enabled=y
+autorestart=n

@@ -1,0 +1,46 @@
+require "option_parser"
+require "socket"
+
+custom_port = nil
+command_args = [] of String
+
+OptionParser.parse(ARGV) do |parser|
+  parser.banner = "Usage: box [options] [command] [service]"
+  parser.on("-C PORT", "--port PORT", "Custom port") { |p| custom_port = p.to_i }
+  parser.on("-h", "--help", "Show help") { puts parser; exit }
+  parser.invalid_option { |arg| command_args << arg }
+end
+
+def find_daemon_port(custom : Int32?)
+  return custom if custom
+  [61040, 209].each do |p|
+    begin
+      socket = TCPSocket.new("127.0.0.1", p)
+      socket.close
+      return p
+    rescue
+    end
+  end
+  61040
+end
+
+port = find_daemon_port(custom_port)
+full_command = ARGV.join(" ")
+
+if full_command.empty?
+  STDERR.puts "\033[31m[FAIL]\033[0m No command provided. Try 'box list' or 'box --help'."
+  exit 1
+end
+
+begin
+  socket = TCPSocket.new("127.0.0.1", port)
+  socket.puts(full_command)
+  while response = socket.gets
+    puts response
+  end
+  socket.close
+rescue ex
+  STDERR.puts "\033[31m[FAIL]\033[0m Could not connect to BoxD daemon on port \033[34m#{port}\033[0m. Is it running?"
+  exit 1
+end
+

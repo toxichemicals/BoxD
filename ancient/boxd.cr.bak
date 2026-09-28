@@ -1,0 +1,670 @@
+require "option_parser"
+require "file_utils"
+require "json"
+require "socket"
+
+lib LibC
+  fun mount(source : UInt8*, target : UInt8*, filesystemtype : UInt8*, mountflags : LibC::ULong, data : Void*) : Int
+  fun waitpid(pid : Int32, status : Int*, options : Int) : Int
+end
+
+module MountD
+  def self.initialize_mounts
+    if Process.pid == 1
+      puts "[MountD] PID 1 detected. Initializing core virtual filesystems..."
+      
+      dirs = ["/proc", "/sys", "/dev", "/dev/pts"]
+      dirs.each { |d| Dir.mkdir_p(d) rescue nil }
+
+      flags = LibC::ULong.new(0)
+      LibC.mount("proc".to_unsafe, "/proc".to_unsafe, "proc".to_unsafe, flags, nil)
+      LibC.mount("sysfs".to_unsafe, "/sys".to_unsafe, "sysfs".to_unsafe, flags, nil)
+      LibC.mount("devtmpfs".to_unsafe, "/dev".to_unsafe, "devtmpfs".to_unsafe, flags, nil)
+      LibC.mount("devpts".to_unsafe, "/dev/pts".to_unsafe, "devpts".to_unsafe, flags, nil)
+
+      # Bring up loopback interface immediately for socket availability
+      puts "[MountD] Bringing up loopback interface (lo)..."
+      Process.run("ip", ["link", "set", "lo", "up"]) rescue nil
+
+      if File.exists?("/etc/fstab")
+        puts "[MountD] Found /etc/fstab, executing mount -a..."
+        Process.run("mount", ["-a"]) rescue nil
+      end
+      puts "[MountD] Core mounts completed successfully."
+    end
+  end
+end
+
+module ReapD
+  def self.start_reaper
+    if Process.pid == 1
+      puts "[ReapD] Initializing system-wide zombie process reaper for PID 1..."
+      spawn do
+        loop do
+          status = 0
+          pid = LibC.waitpid(-1, pointerof(status), 0)
+          if pid <= 0
+            sleep 0.1.seconds
+          end
+        end
+      end
+    end
+  end
+end
+
+class ServiceConfig
+  property name : String
+  property file_path : String
+  property runner : String?
+  property shell : String?
+  property path_env : String?
+  property exec_cmd : String?
+  property inscript : String?
+  property shutdown_cmd : String?
+  property autorestart : Bool = false
+  property waiton : String?
+  property enabled : Bool = true
+
+  def initialize(@name : String, @file_path : String)
+    reload
+  end
+
+  def reload
+    content = File.read(@file_path)
+    lines = content.lines
+    in_inscript = false
+    inscript_buffer = [] of String
+
+    lines.each do |line|
+      stripped = line.strip
+
+      if in_inscript
+        if stripped == "}"
+          in_inscript = false
+          @inscript = inscript_buffer.join("\n")
+        else
+          inscript_buffer << line
+        end
+        next
+      end
+
+      if stripped.starts_with?("Inscript{")
+        in_inscript = true
+        next
+      end
+
+      next if stripped.empty? || stripped.starts_with?("#")
+      parts = stripped.split('=', 2)
+      next if parts.size != 2
+      key = parts[0].strip.downcase
+      val = parts[1].strip
+
+      case key
+      when "runner" then @runner = val
+      when "shell" then @shell = val
+      when "path" then @path_env = val
+      when "exec" then @exec_cmd = val
+      when "shutdown" then @shutdown_cmd = val
+      when "autorestart" then @autorestart = (val.downcase == "y" || val.downcase == "true")
+      when "waiton" then @waiton = val
+      when "enabled" then @enabled = (val.downcase == "y" || val.downcase == "true")
+      end
+    end
+  end
+
+  def set_enabled(status : Bool)
+    @enabled = status
+    lines = File.read_lines(@file_path)
+    found = false
+    updated = lines.map do |line|
+      if line.strip.downcase.starts_with?("enabled")
+        found = true
+        "enabled=#{status ? "y" : "n"}"
+      else
+        line
+      end
+    end
+    unless found
+      updated << "enabled=#{status ? "y" : "n"}"
+    end
+    File.write(@file_path, updated.join("\n") + "\n")
+  end
+end
+
+class ServiceRunner
+  property config : ServiceConfig
+  property process : Process?
+  property running : Bool = false
+  property journals_dir : String
+
+  def initialize(@config : ServiceConfig, @journals_dir : String)
+  end
+
+  def start(io : IO? = nil)
+    unless @config.enabled
+      io.try &.puts("\033[33m[WARN]\033[0m Service #{@config.name} is disabled.")
+      return false
+    end
+
+    if @running
+      return true
+    end
+
+    @running = true
+
+    cmd = @config.exec_cmd
+    ins = @config.inscript
+
+    unless cmd || ins
+      @running = false
+      io.try &.puts("\033[31m[FAIL]\033[0m (Missing 'exec' or 'Inscript')")
+      return false
+    end
+
+    spawn do
+      log_path = File.join(@journals_dir, "#{@config.name}.log")
+
+      begin
+        loop do
+          shell_bin = if sh = @config.shell
+            (sh.downcase == "true" || sh.downcase == "y") ? "/bin/sh" : sh
+          else
+            "/bin/sh"
+          end
+
+          env = ENV.to_h
+          if p = @config.path_env
+            current_path = ENV["PATH"]? || "/bin:/usr/bin:/usr/local/bin"
+            env["PATH"] = "#{p}:#{current_path}"
+          end
+
+          begin
+            is_tty = @config.name =~ /^tty\d+$/
+
+            if is_tty
+              tty_device = File.join("/dev", @config.name)
+              tty_io = File.open(tty_device, "r+") rescue nil
+
+              exec_str = cmd.not_nil!
+              split_cmd = exec_str.split(" ")
+              exec_target = split_cmd[0]
+              args = [] of String
+              if split_cmd.size > 1
+                split_cmd[1..-1].each { |a| args << a }
+              end
+
+              proc = Process.new(
+                exec_target,
+                args: args,
+                env: env,
+                input: tty_io || Process::Redirect::Inherit,
+                output: tty_io || Process::Redirect::Inherit,
+                error: tty_io || Process::Redirect::Inherit
+              )
+              @process = proc
+              status = proc.wait
+              tty_io.try &.close
+            else
+              log_file = File.open(log_path, "a")
+              log_file.puts("\n--- [BoxD] Starting #{@config.name} at #{Time.local} ---")
+              
+              if script_body = @config.inscript
+                proc = Process.new(
+                  shell_bin,
+                  env: env,
+                  output: log_file,
+                  error: log_file,
+                  input: Process::Redirect::Pipe
+                )
+                proc.input.print(script_body)
+                proc.input.close
+                @process = proc
+                status = proc.wait
+              else
+                exec_str = cmd.not_nil!
+                exec_target = ""
+                args = [] of String
+
+                if @config.shell
+                  exec_target = shell_bin
+                  args = ["-c", exec_str]
+                else
+                  split_cmd = exec_str.split(" ")
+                  exec_target = split_cmd[0]
+                  if split_cmd.size > 1
+                    split_cmd[1..-1].each { |a| args << a }
+                  end
+                end
+
+                proc = Process.new(
+                  exec_target,
+                  args: args,
+                  env: env,
+                  output: log_file,
+                  error: log_file
+                )
+                @process = proc
+                status = proc.wait
+              end
+
+              log_file.puts("--- [BoxD] Exited with code #{status.exit_code} at #{Time.local} ---")
+              log_file.close
+            end
+          rescue ex
+            puts "[BoxD Error] Failed to run #{@config.name}: #{ex.message}"
+          end
+
+          break unless @config.autorestart && @running
+          sleep 2.seconds
+        end
+      ensure
+        @process = nil
+        @running = false
+      end
+    end
+
+    io.try &.puts("\033[32m[OK]\033[0m")
+    true
+  end
+
+  def stop(io : IO? = nil)
+    unless @running
+      io.try &.puts("\033[31m[FAIL]\033[0m (Not running)")
+      return false
+    end
+
+    if sc = @config.shutdown_cmd
+      io.try &.print("Running shutdown script for #{@config.name} >> ")
+      shell_bin = if sh = @config.shell
+        (sh.downcase == "true" || sh.downcase == "y") ? "/bin/sh" : sh
+      else
+        "/bin/sh"
+      end
+
+      env = ENV.to_h
+      if p = @config.path_env
+        current_path = ENV["PATH"]? || "/bin:/usr/bin:/usr/local/bin"
+        env["PATH"] = "#{p}:#{current_path}"
+      end
+
+      begin
+        log_path = File.join(@journals_dir, "#{@config.name}.log")
+        log_file = File.open(log_path, "a")
+        log_file.puts("\n--- [BoxD] Running shutdown command for #{@config.name} at #{Time.local} ---")
+        
+        status = Process.run(shell_bin, args: ["-c", sc], env: env, output: log_file, error: log_file)
+        log_file.puts("--- [BoxD] Shutdown command exited with #{status.exit_code} ---")
+        log_file.close
+        io.try &.puts("\033[32m[OK]\033[0m")
+      rescue ex
+        io.try &.puts("\033[31m[FAIL]\033[0m (#{ex.message})")
+      end
+    end
+
+    @running = false
+    if proc = @process
+      begin
+        proc.terminate
+        proc.wait
+      rescue
+        # Already exited
+      end
+      @process = nil
+    end
+    
+    io.try &.puts("\033[32m[OK]\033[0m")
+    true
+  end
+end
+
+def start_with_dependencies(name : String, services : Hash(String, ServiceRunner), client_io : IO? = nil, visiting = [] of String)
+  runner = services[name]?
+  unless runner
+    client_io.try &.puts("#{name} >> \033[31m[FAIL]\033[0m (Dependency not found)")
+    return false
+  end
+
+  if visiting.includes?(name)
+    client_io.try &.puts("#{name} >> \033[31m[FAIL]\033[0m (Circular dependency detected!)")
+    return false
+  end
+
+  if runner.running
+    return true
+  end
+
+  if parent_name = runner.config.waiton
+    client_io.try &.puts("\033[33m[INFO]\033[0m #{name} waiting on dependency #{parent_name}...")
+    success = start_with_dependencies(parent_name, services, client_io, visiting + [name])
+    unless success
+      client_io.try &.puts("#{name} >> \033[31m[FAIL]\033[0m (Failed to start dependency #{parent_name})")
+      return false
+    end
+  end
+
+  client_io.try &.print("#{name} >> ")
+  runner.start(client_io)
+end
+
+def stop_with_dependencies(name : String, services : Hash(String, ServiceRunner), client_io : IO? = nil, stopped = [] of String)
+  return if stopped.includes?(name)
+  runner = services[name]?
+  return unless runner
+
+  services.each do |other_name, other_runner|
+    if other_runner.config.waiton == name && other_runner.running
+      stop_with_dependencies(other_name, services, client_io, stopped)
+    end
+  end
+
+  if runner.running
+    client_io.try &.print("#{name} >> ")
+    runner.stop(client_io)
+    stopped << name
+  end
+end
+
+def perform_system_shutdown(services : Hash(String, ServiceRunner))
+  puts "\n[BoxD] Shutting down all services in reverse dependency order..."
+  services.keys.each do |name|
+    stop_with_dependencies(name, services, STDOUT)
+  end
+  puts "[BoxD] Shutdown complete. Goodbye!"
+end
+
+def process_journal_action(target : String, services : Hash(String, ServiceRunner), journals_dir : String, client : IO, &block : Array(String) -> Enumerable(String))
+  if target == "all"
+    services.each_key do |name|
+      log_path = File.join(journals_dir, "#{name}.log")
+      if File.exists?(log_path)
+        client.puts "--- Journal for #{name} ---"
+        lines = File.read_lines(log_path)
+        yield(lines).each { |l| client.puts l }
+      end
+    end
+  elsif services.has_key?(target)
+    log_path = File.join(journals_dir, "#{target}.log")
+    if File.exists?(log_path)
+      client.puts "--- Journal for #{target} ---"
+      lines = File.read_lines(log_path)
+      yield(lines).each { |l| client.puts l }
+    else
+      client.puts "\033[33m[WARN]\033[0m No journal logs found for #{target}."
+    end
+  else
+    client.puts "Journal #{target} >> \033[31m[FAIL]\033[0m (Service not found)"
+  end
+end
+
+def process_journal_clear(target : String, services : Hash(String, ServiceRunner), journals_dir : String, client : IO, keep_count : Int32)
+  targets = target == "all" ? services.keys : [target]
+  targets.each do |name|
+    unless services.has_key?(name)
+      client.puts "Journal clear #{name} >> \033[31m[FAIL]\033[0m (Service not found)"
+      next
+    end
+    log_path = File.join(journals_dir, "#{name}.log")
+    if File.exists?(log_path)
+      if keep_count > 0
+        lines = File.read_lines(log_path)
+        truncated = lines.last(keep_count)
+        File.write(log_path, truncated.join("\n") + (truncated.empty? ? "" : "\n"))
+      else
+        File.write(log_path, "")
+      end
+      client.puts "Journal clear #{name} >> \033[32m[OK]\033[0m"
+    else
+      client.puts "Journal clear #{name} >> \033[33m[WARN]\033[0m (No log file found)"
+    end
+  end
+end
+
+# Request handler logic shared between TCP and UNIX sockets
+def handle_client_request(client : IO, services : Hash(String, ServiceRunner), dir : String, journals_dir : String, db_path : String, serv_files : Array(String))
+  request = client.gets
+  if request
+    args = request.strip.split(/\s+/)
+    cmd = args[0]? ? args[0].downcase : ""
+
+    case cmd
+    when "--help", "help"
+      client.puts "\033[1mBoxD Command Reference:\033[0m"
+      client.puts "  start <service>                   - Start a service (and dependencies)"
+      client.puts "  stop <service>                    - Stop a service (and dependents)"
+      client.puts "  restart <service>                 - Restart a service"
+      client.puts "  reload                            - Reload service configurations"
+      client.puts "  enable [--now] <service>          - Enable a service"
+      client.puts "  disable [--now] <service>         - Disable a service"
+      client.puts "  journal <service>                 - View full journal for a service"
+      client.puts "  journal -t <lines> <service|all>  - Tail journal lines"
+      client.puts "  journal -h <lines> <service|all>  - Head journal lines"
+      client.puts "  journal -c [<lines>] <service|all>- Clear or truncate journal"
+      client.puts "  list                              - List all loaded services"
+    when "start"
+      target = args[1]? || ""
+      if services.has_key?(target)
+        start_with_dependencies(target, services, client)
+      else
+        client.puts "#{target} >> \033[31m[FAIL]\033[0m (Service not found)"
+      end
+    when "stop"
+      target = args[1]? || ""
+      if services.has_key?(target)
+        stop_with_dependencies(target, services, client)
+      else
+        client.puts "#{target} >> \033[31m[FAIL]\033[0m (Service not found)"
+      end
+    when "restart"
+      target = args[1]? || ""
+      if services.has_key?(target)
+        client.puts "Restarting #{target}..."
+        stop_with_dependencies(target, services, client)
+        sleep 1.second
+        start_with_dependencies(target, services, client)
+      else
+        client.puts "Restart #{target} >> \033[31m[FAIL]\033[0m (Service not found)"
+      end
+    when "reload"
+      serv_files = Dir.glob(File.join(dir, "*.serv"))
+      current_names = services.keys
+      new_names = serv_files.map { |f| File.basename(f, ".serv") }
+      
+      current_names.each do |name|
+        unless new_names.includes?(name)
+          stop_with_dependencies(name, services, nil)
+          services.delete(name)
+        end
+      end
+      
+      serv_files.each do |file|
+        name = File.basename(file, ".serv")
+        if runner = services[name]?
+          runner.config.file_path = file
+          runner.config.reload
+        else
+          config = ServiceConfig.new(name, file)
+          services[name] = ServiceRunner.new(config, journals_dir)
+        end
+      end
+      
+      meta = services.map { |n, r| { "name" => n, "path" => r.config.file_path } }
+      File.write(db_path, meta.to_json)
+      client.puts "Reload services >> \033[32m[OK]\033[0m"
+    when "enable"
+      target = args[1]? || ""
+      flag = args[2]? || ""
+      if runner = services[target]?
+        runner.config.set_enabled(true)
+        client.puts "Enable #{target} >> \033[32m[OK]\033[0m"
+        if flag == "--now"
+          start_with_dependencies(target, services, client)
+        end
+      else
+        client.puts "Enable #{target} >> \033[31m[FAIL]\033[0m (Service not found)"
+      end
+    when "disable"
+      target = args[1]? || ""
+      flag = args[2]? || ""
+      if runner = services[target]?
+        if flag == "--now" || runner.running
+          stop_with_dependencies(target, services, client)
+        end
+        runner.config.set_enabled(false)
+        client.puts "Disable #{target} >> \033[32m[OK]\033[0m"
+      else
+        client.puts "Disable #{target} >> \033[31m[FAIL]\033[0m (Service not found)"
+      end
+    when "journal"
+      subflag = args[1]?
+      if subflag && subflag.starts_with?("-")
+        flag_type = subflag[1]?
+        case flag_type
+        when 't', 'h'
+          count = args[2]?.try(&.to_i?) || 10
+          target = args[3]? || ""
+          process_journal_action(target, services, journals_dir, client) do |lines|
+            flag_type == 't' ? lines.last(count) : lines.first(count)
+          end
+        when 'c'
+          arg2 = args[2]?
+          if arg2 && arg2.to_i?
+            count = arg2.to_i
+            target = args[3]? || "all"
+            process_journal_clear(target, services, journals_dir, client, count)
+          else
+            target = arg2 || "all"
+            process_journal_clear(target, services, journals_dir, client, 0)
+          end
+        else
+          client.puts "Unknown journal flag >> \033[31m[FAIL]\033[0m (#{subflag})"
+        end
+      else
+        target = args[1]? || ""
+        process_journal_action(target, services, journals_dir, client) { |lines| lines }
+      end
+    when "list"
+      client.puts "\033[1mLoaded Services:\033[0m"
+      services.each do |name, runner|
+        status = runner.running ? "\033[32mRUNNING\033[0m" : "\033[31mSTOPPED\033[0m"
+        enabled_status = runner.config.enabled ? "\033[32m[enabled]\033[0m" : "\033[33m[disabled]\033[0m"
+        dep_info = runner.config.waiton ? " (waits on: #{runner.config.waiton})" : ""
+        shell_info = runner.config.shell ? " [shell: #{runner.config.shell}]" : ""
+        path_info = runner.config.path_env ? " [path: #{runner.config.path_env}]" : ""
+        script_type = runner.config.inscript ? " [type: Inscript]" : " (exec: #{runner.config.exec_cmd})"
+        client.puts " - #{name} [#{status}] #{enabled_status}#{dep_info}#{shell_info}#{path_info}#{script_type}"
+      end
+    else
+      client.puts "Unknown command >> \033[31m[FAIL]\033[0m (#{request.strip})"
+    end
+  end
+end
+
+userland = false
+dir = (Process.pid == 1) ? "/services/" : Dir.current
+custom_port = nil.as(Int32?)
+
+OptionParser.parse do |parser|
+  parser.banner = "Usage: boxd [options]"
+  parser.on("-u", "--user", "Run in userland mode") { userland = true }
+  parser.on("-d DIR", "--dir DIR", "Directory containing .serv files") { |d| dir = d }
+  parser.on("-C PORT", "--port PORT", "Custom TCP port") { |p| custom_port = p.to_i }
+  parser.on("-h", "--help", "Show this help") { puts parser; exit }
+end
+
+# 1. Initialize MountD, loopback interface, and ReapD right away before anything else
+MountD.initialize_mounts
+ReapD.start_reaper
+
+port = userland ? 61040 : 209
+if cp = custom_port
+  port = cp
+end
+
+Dir.mkdir_p(dir) unless Dir.exists?(dir)
+journals_dir = File.join(dir, "journals")
+Dir.mkdir_p(journals_dir)
+
+# 2. Spin up the UNIX domain socket server and TCP server immediately
+sock_path = File.join(dir, "boxd.sock")
+File.delete(sock_path) if File.exists?(sock_path)
+unix_server = UNIXServer.new(sock_path)
+tcp_server = TCPServer.new("127.0.0.1", port)
+
+serv_files = Dir.glob(File.join(dir, "*.serv"))
+puts "Discovering services >> [\033[34m#{serv_files.size}\033[0m] \033[32m[OK]\033[0m"
+
+db_path = File.join(dir, "services.db")
+services = {} of String => ServiceRunner
+services_meta = [] of Hash(String, String)
+
+print "Compiling database >> "
+begin
+  serv_files.each do |file|
+    name = File.basename(file, ".serv")
+    config = ServiceConfig.new(name, file)
+    services[name] = ServiceRunner.new(config, journals_dir)
+    services_meta << { "name" => name, "path" => file }
+  end
+  File.write(db_path, services_meta.to_json)
+  print "\033[32m[OK]\033[0m\n"
+rescue ex
+  print "\033[31m[FAIL]\033[0m\n"
+  STDERR.puts "[BoxD Error] #{ex.message}"
+  exit 1
+end
+
+Signal::INT.trap do
+  File.delete(sock_path) if File.exists?(sock_path)
+  perform_system_shutdown(services)
+  exit 0
+end
+
+Signal::TERM.trap do
+  File.delete(sock_path) if File.exists?(sock_path)
+  perform_system_shutdown(services)
+  exit 0
+end
+
+puts "Auto-starting enabled services >>"
+failed_services = [] of String
+services.each do |name, runner|
+  if runner.config.enabled && !runner.running
+    success = start_with_dependencies(name, services, STDOUT)
+    unless success
+      failed_services << name
+    end
+  end
+end
+
+unless failed_services.empty?
+  STDERR.puts "\033[31mServices failed to start; check journal for: #{failed_services}\033[0m"
+end
+
+puts "Daemons active: TCP port \033[34m#{port}\033[0m, UNIX socket \033[34m#{sock_path}\033[0m [\033[32mMode: #{userland ? "Userland" : "System"}\033[0m]"
+
+# 3. Accept connections concurrently from both TCP and UNIX servers
+spawn do
+  while client = tcp_server.accept?
+    spawn do
+      begin
+        handle_client_request(client, services, dir, journals_dir, db_path, serv_files)
+      ensure
+        client.close rescue nil
+      end
+    end
+  end
+end
+
+spawn do
+  while client = unix_server.accept?
+    spawn do
+      begin
+        handle_client_request(client, services, dir, journals_dir, db_path, serv_files)
+      ensure
+        client.close rescue nil
+      end
+    end
+  end
+end
+
+sleep
