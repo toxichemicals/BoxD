@@ -1,4 +1,4 @@
 # tty1 service configuration for BoxD
-exec=/bin/getty -n -l /bin/bash 38400 tty1
+exec=/bin/getty -n -l /bin/fish 38400 tty1
 enabled=y
 autorestart=y
