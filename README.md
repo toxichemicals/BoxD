@@ -23,15 +23,15 @@ BoxD Linux is a new Linux distro featuring a base chain of it's own tools.
 You shouldn't. Goofy-goober.
 
 # Build
-./build.sh builds the OS.
-./bootiso.sh creates a bootable iso.
-./qemu.sh is my preset for qemu to load it.
+* ./build.sh builds the OS.
+* ./bootiso.sh creates a bootable iso.
+* ./qemu.sh is my preset for qemu to load it.
 
 # TO-DO: Dependencies
 Don't got time for this yet!
 
 
 # Contributors
-t0x1ch3m1cals (Lead-Dev)
-cyberstar (Co-dev)
+* t0x1ch3m1cals (Lead-Dev)
+* cyberstar (Co-dev)
 
