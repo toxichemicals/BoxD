@@ -1,0 +1,18 @@
+# BoxD Zellij Initialization and PTY Mounting Service
+shell=/bin/bash
+exec=[inline]
+autorestart=false
+enabled=true
+
+inline{
+echo "[ZellijStuffs] Preparing environment directories for Zellij..."
+mkdir -p /root/.config/zellij /root/.cache/zellij
+mkdir -p /tmp/zellij
+
+echo "[ZellijStuffs] Mounting pseudo-terminal filesystem (devpts)..."
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts || true
+ln -sf /dev/pts/ptmx /dev/ptmx || true
+
+echo "[ZellijStuffs] Zellij runtime environment successfully provisioned."
+}
