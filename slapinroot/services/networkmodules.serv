@@ -1,0 +1,26 @@
+# BoxedOS Networking Kernel Modules Initialization Service
+shell=/bin/bash
+exec=[inline]
+autorestart=false
+enabled=true
+
+inline{
+echo "[NetMods] Initializing system bus and PCIe controllers..."
+modprobe pcieport || true
+# Pcieport is NOT fatal, don't worry.
+echo "|--- if pcieport failed and stated as fatal, don't worry, it isnt fatal."
+echo ""
+echo "[NetMods] Loading standard Ethernet drivers..."
+modprobe e1000 || true
+modprobe virtio_net || true
+modprobe r8169 || true
+modprobe igb || true
+
+echo "[NetMods] Loading wireless (Wi-Fi) stack and common card drivers..."
+modprobe cfg80211 || true
+modprobe mac80211 || true
+modprobe iwlwifi || true
+modprobe ath9k || true
+modprobe rtl8192cu || true
+
+}

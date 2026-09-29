@@ -1,1 +1,4 @@
-hi
+Hi, welcome to BoxdOS!
+Have a look around, this is only a alpha build... imagine what the feature beholds in the releases!
+
+** Easter egg

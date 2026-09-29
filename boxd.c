@@ -47,6 +47,7 @@ char journals_dir[256];
 char base_dir[256];
 int start_service_recursive(Service* s, int client_fd, char visited[][128], int depth);
 int stop_service_recursive(Service* s, int client_fd);
+
 // --- MountD & ReapD ---
 void initialize_mounts() {
     if (getpid() == 1) {
@@ -74,11 +75,8 @@ void initialize_mounts() {
 
 void* start_reaper(void* arg) {
     if (getpid() == 1) {
-        // printf("[ReapD] Initializing zombie process reaper (Event-Driven Mode)...\n");
-        
         while (1) {
             int status;
-            // BLOCK until ANY child process dies.
             pid_t pid = waitpid(-1, &status, 0);
 
             if (pid > 0) {
@@ -143,7 +141,7 @@ void parse_service_file(const char* filepath, Service* s) {
             continue;
         }
 
-        if (strncmp(trimmed, "Inscript{", 9) == 0) {
+        if (strncasecmp(trimmed, "inline{", 7) == 0 || strncasecmp(trimmed, "Inscript{", 9) == 0) {
             in_inscript = 1;
             continue;
         }
@@ -287,7 +285,6 @@ int start_service_recursive(Service* s, int client_fd, char visited[][128], int 
                 if (tty_fd > 2) close(tty_fd);
             }
         } else {
-            // Assign background services their own Process Group ID so the whole tree can be killed
             setpgid(0, 0); 
             
             char log_path[256];
@@ -302,19 +299,28 @@ int start_service_recursive(Service* s, int client_fd, char visited[][128], int 
         char* shell = (strlen(s->shell) > 0) ? s->shell : "/bin/sh";
         if (strcasecmp(shell, "true") == 0 || strcasecmp(shell, "y") == 0) shell = "/bin/sh";
 
-        if (strlen(s->inscript) > 0) {
+        if (strlen(s->inscript) > 0 || strcasecmp(s->exec_cmd, "[inline]") == 0) {
             int pipefds[2];
-            pipe(pipefds);
-            if (fork() == 0) {
-                dup2(pipefds[0], 0);
+            if (pipe(pipefds) < 0) _exit(127);
+            
+            pid_t sub_pid = fork();
+            if (sub_pid < 0) _exit(127);
+            if (sub_pid == 0) {
+                close(pipefds[0]);
+                write(pipefds[1], s->inscript, strlen(s->inscript));
                 close(pipefds[1]);
-                execle(shell, shell, NULL, child_env);
-                _exit(127);
+                _exit(0);
             }
-            close(pipefds[0]);
-            write(pipefds[1], s->inscript, strlen(s->inscript));
             close(pipefds[1]);
-            exit(0);
+            dup2(pipefds[0], 0);
+            close(pipefds[0]);
+
+            int status_val;
+            waitpid(sub_pid, &status_val, 0);
+
+            char* args[] = {shell, NULL};
+            execve(shell, args, child_env);
+            _exit(127);
         } else {
             char* args[4];
             args[0] = shell;
@@ -484,14 +490,12 @@ void* handle_client(void* arg) {
         } else if (strcasecmp(argv[0], "poweroff") == 0 || strcasecmp(argv[0], "shutdown") == 0) {
             dprintf(client_fd, "System is shutting down...\n");
             
-            // Stop all running services gracefully
             for (int i = 0; i < service_count; i++) {
                 if (services[i].running) {
                     stop_service_recursive(&services[i], -1);
                 }
             }
 
-            // Sync filesystems and power off if PID 1
             sync();
             if (getpid() == 1) {
                 reboot(RB_POWER_OFF);
@@ -629,7 +633,6 @@ int main(int argc, char* argv[]) {
     }
 
     initialize_mounts();
-    //verify_and_link_libraries();
 
     pthread_t reaper;
     pthread_create(&reaper, NULL, start_reaper, NULL);
@@ -659,7 +662,6 @@ int main(int argc, char* argv[]) {
 
     printf("Starting Services:\n");
 
-    // --- Prioritize starting tty1 immediately ---
     for (int i = 0; i < service_count; i++) {
         if (strcmp(services[i].name, "tty1") == 0 && services[i].enabled && !services[i].running) {
             char visited[128][128];
@@ -669,7 +671,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // --- Start remaining services ---
     for (int i = 0; i < service_count; i++) {
         if (strcmp(services[i].name, "tty1") != 0 && services[i].enabled && !services[i].running) {
             char visited[128][128];

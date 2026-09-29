@@ -1,5 +1,0 @@
-# tty1 service configuration for BoxD
-exec=/bin/modprobe e1000 
-enabled=y
-autorestart=n
-

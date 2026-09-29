@@ -104,8 +104,39 @@ while client = server.accept?
           if iface = args[1]?
             if get_interfaces.includes?(iface)
               client.puts "Broadcasting DHCP request on #{iface}..."
+              
+              # Ensure standard udhcpc event script exists
+              script_path = "/etc/udhcpc.script"
+              unless File.exists?(script_path)
+                Dir.mkdir_p("/etc") rescue nil
+                script_content = <<-SCRIPT
+#!/bin/sh
+case "$1" in
+    deconfig)
+        ip addr flush dev "$interface"
+        ;;
+    bound|renew)
+        ip addr flush dev "$interface"
+        ip addr add "$ip/$subnet" dev "$interface"
+        if [ -n "$router" ]; then
+            ip route del default via "$router" dev "$interface" 2>/dev/null || true
+            ip route add default via "$router" dev "$interface"
+        fi
+        if [ -n "$dns" ]; then
+            echo "nameserver $dns" > /etc/resolv.conf
+        fi
+        ;;
+esac
+SCRIPT
+                File.write(script_path, script_content)
+                Process.run("chmod", ["+x", script_path])
+              end
+
               spawn do
-                Process.run("udhcpc", ["-i", iface.not_nil!, "-n", "-q"])
+                # 1. Bring the link up before querying DHCP
+                Process.run("ip", ["link", "set", iface.not_nil!, "up"])
+                # 2. Run udhcpc with our event script
+                Process.run("udhcpc", ["-i", iface.not_nil!, "-s", script_path, "-n", "-q"])
               end
               client.puts "DHCP daemon dispatched for #{iface} >> \033[32m[OK]\033[0m"
             else

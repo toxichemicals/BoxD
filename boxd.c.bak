@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <time.h>
+#include <sys/reboot.h>
 
 #define MAX_SERVICES 128
 #define PORT 209
@@ -44,11 +45,12 @@ int service_count = 0;
 pthread_mutex_t services_lock = PTHREAD_MUTEX_INITIALIZER;
 char journals_dir[256];
 char base_dir[256];
-
+int start_service_recursive(Service* s, int client_fd, char visited[][128], int depth);
+int stop_service_recursive(Service* s, int client_fd);
 // --- MountD & ReapD ---
 void initialize_mounts() {
     if (getpid() == 1) {
-        printf("[MountD] PID 1 detected. Initializing core virtual filesystems...\n");
+        printf("[MountD] PID 1 detected; Mounting filesystems.\n");
         mkdir("/proc", 0755);
         mkdir("/sys", 0755);
         mkdir("/dev", 0755);
@@ -70,34 +72,47 @@ void initialize_mounts() {
     }
 }
 
-void verify_and_link_libraries() {
-    struct stat st;
-    if (stat("/usr/lib/libpcre2-8.so.0.15.0", &st) == 0 && stat("/usr/lib/libpcre2-8.so.0", &st) != 0) {
-        symlink("/usr/lib/libpcre2-8.so.0.15.0", "/usr/lib/libpcre2-8.so.0");
-        printf("[LibD] Created symlink for libpcre2-8.so.0 -> libpcre2-8.so.0.15.0 [OK]\n");
-    }
-    // Refresh dynamic linker run-time bindings
-    system("ldconfig >/dev/null 2>&1");
-}
-
 void* start_reaper(void* arg) {
     if (getpid() == 1) {
-        printf("[ReapD] Initializing zombie process reaper...\n");
+        // printf("[ReapD] Initializing zombie process reaper (Event-Driven Mode)...\n");
+        
         while (1) {
-            pid_t pid;
             int status;
-            while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+            // BLOCK until ANY child process dies.
+            pid_t pid = waitpid(-1, &status, 0);
+
+            if (pid > 0) {
                 pthread_mutex_lock(&services_lock);
+                
                 for (int i = 0; i < service_count; i++) {
                     if (services[i].pid == pid) {
                         services[i].running = 0;
                         services[i].pid = 0;
+                        
+                        FILE* log_f = fopen("/services/reaped.log", "a");
+                        
+                        if (services[i].autorestart && services[i].enabled) {
+                            if (log_f) {
+                                fprintf(log_f, "[ReapD] Service '%s' crashed! Autorestarting...\n", services[i].name);
+                            }
+                            char visited[128][128];
+                            start_service_recursive(&services[i], -1, visited, 0);
+                        } else {
+                            if (log_f) {
+                                fprintf(log_f, "[ReapD] Service '%s' exited.\n", services[i].name);
+                            }
+                        }
+                        
+                        if (log_f) fclose(log_f);
                         break;
                     }
                 }
+                
                 pthread_mutex_unlock(&services_lock);
+            } 
+            else if (pid == -1 && errno == ECHILD) {
+                sleep(1);
             }
-            usleep(100000);
         }
     }
     return NULL;
@@ -196,8 +211,6 @@ void set_service_enabled_status(Service* s, int status) {
     }
 }
 
-int stop_service_recursive(Service* s, int client_fd);
-
 // --- Dependency-Aware Execution ---
 int start_service_recursive(Service* s, int client_fd, char visited[][128], int depth) {
     if (!s->enabled) {
@@ -274,6 +287,9 @@ int start_service_recursive(Service* s, int client_fd, char visited[][128], int 
                 if (tty_fd > 2) close(tty_fd);
             }
         } else {
+            // Assign background services their own Process Group ID so the whole tree can be killed
+            setpgid(0, 0); 
+            
             char log_path[256];
             snprintf(log_path, sizeof(log_path), "%s/%s.log", journals_dir, s->name);
             int log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
@@ -334,9 +350,9 @@ int stop_service_recursive(Service* s, int client_fd) {
     }
 
     if (s->pid > 0) {
-        kill(s->pid, SIGTERM);
+        kill(-s->pid, SIGTERM); 
         usleep(300000);
-        kill(s->pid, SIGKILL);
+        kill(-s->pid, SIGKILL);
     }
 
     s->running = 0;
@@ -451,6 +467,7 @@ void* handle_client(void* arg) {
                 "  reload                            - Reload service configurations\n"
                 "  enable [--now] <service>          - Enable a service\n"
                 "  disable [--now] <service>         - Disable a service\n"
+                "  poweroff / shutdown               - Power off the system\n"
                 "  journal <service>                 - View full journal for a service\n"
                 "  journal -t <lines> <service|all>  - Tail journal lines\n"
                 "  journal -h <lines> <service|all>  - Head journal lines\n"
@@ -464,6 +481,24 @@ void* handle_client(void* arg) {
                 char* enabled = services[i].enabled ? "\033[32m[enabled]\033[0m" : "\033[33m[disabled]\033[0m";
                 dprintf(client_fd, " - %s [%s] %s\n", services[i].name, status, enabled);
             }
+        } else if (strcasecmp(argv[0], "poweroff") == 0 || strcasecmp(argv[0], "shutdown") == 0) {
+            dprintf(client_fd, "System is shutting down...\n");
+            
+            // Stop all running services gracefully
+            for (int i = 0; i < service_count; i++) {
+                if (services[i].running) {
+                    stop_service_recursive(&services[i], -1);
+                }
+            }
+
+            // Sync filesystems and power off if PID 1
+            sync();
+            if (getpid() == 1) {
+                reboot(RB_POWER_OFF);
+            } else {
+                system("poweroff");
+            }
+            exit(0);
         } else if (strcasecmp(argv[0], "start") == 0 && argc > 1) {
             char visited[128][128];
             for (int i = 0; i < service_count; i++) {
@@ -594,7 +629,7 @@ int main(int argc, char* argv[]) {
     }
 
     initialize_mounts();
-    verify_and_link_libraries();
+    //verify_and_link_libraries();
 
     pthread_t reaper;
     pthread_create(&reaper, NULL, start_reaper, NULL);
@@ -623,8 +658,20 @@ int main(int argc, char* argv[]) {
     }
 
     printf("Starting Services:\n");
+
+    // --- Prioritize starting tty1 immediately ---
     for (int i = 0; i < service_count; i++) {
-        if (services[i].enabled && !services[i].running) {
+        if (strcmp(services[i].name, "tty1") == 0 && services[i].enabled && !services[i].running) {
+            char visited[128][128];
+            printf("Starting Primary Console (tty1):\n");
+            start_service_recursive(&services[i], STDOUT_FILENO, visited, 0);
+            break;
+        }
+    }
+
+    // --- Start remaining services ---
+    for (int i = 0; i < service_count; i++) {
+        if (strcmp(services[i].name, "tty1") != 0 && services[i].enabled && !services[i].running) {
             char visited[128][128];
             start_service_recursive(&services[i], STDOUT_FILENO, visited, 0);
         }
