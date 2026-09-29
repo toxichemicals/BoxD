@@ -17,6 +17,40 @@ for arg in "$@"; do
     esac
 done
 
+echo "[+] Checking for kernel modules in slapinroot..."
+if [ ! -d "slapinroot/lib/modules" ]; then
+    # Look for either .tar.gz or uncompressed .tar
+    ARCHIVE=""
+    if [ -f "BoxDModules.tar.gz" ]; then
+        ARCHIVE="BoxDModules.tar.gz"
+    elif [ -f "BoxDModules.tar" ]; then
+        ARCHIVE="BoxDModules.tar"
+    fi
+
+    if [ -n "$ARCHIVE" ]; then
+        echo "[+] Found $ARCHIVE, extracting modules..."
+        tar -xf "$ARCHIVE"
+        
+        # Handle directory structures gracefully
+        mkdir -p slapinroot/lib
+        if [ -d "BoxDModules/lib/modules" ]; then
+            cp -r BoxDModules/lib/modules slapinroot/lib/
+            rm -rf BoxDModules
+        elif [ -d "lib/modules" ]; then
+            cp -r lib/modules slapinroot/lib/
+            rm -rf lib
+        else
+            echo "[!] Warning: Extracted structure unexpected, attempting direct move..."
+            mv lib/modules slapinroot/lib/ 2>/dev/null || true
+        fi
+    else
+        echo "[!] Error: Kernel modules not found at 'slapinroot/lib/modules' and archive is missing."
+        echo "[!] Please download 'BoxDModules.tar.gz' from Google Drive and place it in this project folder:"
+        echo "[!] https://drive.google.com/file/d/1uV118dbrWDvCm7_wlwjNoe5K174Ib80v/view"
+        exit 1
+    fi
+fi
+
 echo "[+] Building BoxD components..."
 gcc -static boxd.c -o boxd -lpthread
 crystal build --release box.cr -o box
@@ -96,10 +130,6 @@ fi
 echo "[+] Copying kernel to ESP..."
 sudo mkdir -p "$MNT_ESP/boot"
 sudo cp -L "$KERNEL_SRC" "$MNT_ESP/boot/vmlinuz"
-
-echo "[+] Retrieving root filesystem UUID..."
-ROOT_UUID=$(sudo blkid -s UUID -o value "${LOOPDEV}p2")
-echo "[+] Root filesystem UUID: $ROOT_UUID"
 
 echo "[+] Writing GRUB configuration..."
 sudo mkdir -p "$MNT_ESP/boot/grub"

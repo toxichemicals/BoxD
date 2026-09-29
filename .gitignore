@@ -2,3 +2,5 @@ stealkern.iso
 BoxedOS.iso
 BoxedOS/
 iso_build/
+slapinroot/lib/modules/
+BoxDModules.tar.gz
