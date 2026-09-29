@@ -3,7 +3,7 @@ set -e
 
 ISO_DIR="iso_build"
 OUTPUT_ISO="BoxedOS.iso"
-KERNEL_SRC="BoxedOS/boot/vmlinuz"
+KERNEL_SRC="NewKernel"
 INITRAMFS_SRC="BoxedOS/initramfs.cpio"
 
 echo "[*] Preparing ISO staging directory..."
