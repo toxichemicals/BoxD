@@ -45,7 +45,8 @@ int service_count = 0;
 pthread_mutex_t services_lock = PTHREAD_MUTEX_INITIALIZER;
 char journals_dir[256];
 char base_dir[256];
-
+int start_service_recursive(Service* s, int client_fd, char visited[][128], int depth);
+int stop_service_recursive(Service* s, int client_fd);
 // --- MountD & ReapD ---
 void initialize_mounts() {
     if (getpid() == 1) {
@@ -71,34 +72,47 @@ void initialize_mounts() {
     }
 }
 
-void verify_and_link_libraries() {
-    struct stat st;
-    if (stat("/usr/lib/libpcre2-8.so.0.15.0", &st) == 0 && stat("/usr/lib/libpcre2-8.so.0", &st) != 0) {
-        symlink("/usr/lib/libpcre2-8.so.0.15.0", "/usr/lib/libpcre2-8.so.0");
-        printf("[LibD] Created symlink for libpcre2-8.so.0 -> libpcre2-8.so.0.15.0 [OK]\n");
-    }
-    // Refresh dynamic linker run-time bindings
-    system("ldconfig >/dev/null 2>&1");
-}
-
 void* start_reaper(void* arg) {
     if (getpid() == 1) {
-        printf("[ReapD] Initializing zombie process reaper...\n");
+        // printf("[ReapD] Initializing zombie process reaper (Event-Driven Mode)...\n");
+        
         while (1) {
-            pid_t pid;
             int status;
-            while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+            // BLOCK until ANY child process dies.
+            pid_t pid = waitpid(-1, &status, 0);
+
+            if (pid > 0) {
                 pthread_mutex_lock(&services_lock);
+                
                 for (int i = 0; i < service_count; i++) {
                     if (services[i].pid == pid) {
                         services[i].running = 0;
                         services[i].pid = 0;
+                        
+                        FILE* log_f = fopen("/services/reaped.log", "a");
+                        
+                        if (services[i].autorestart && services[i].enabled) {
+                            if (log_f) {
+                                fprintf(log_f, "[ReapD] Service '%s' crashed! Autorestarting...\n", services[i].name);
+                            }
+                            char visited[128][128];
+                            start_service_recursive(&services[i], -1, visited, 0);
+                        } else {
+                            if (log_f) {
+                                fprintf(log_f, "[ReapD] Service '%s' exited.\n", services[i].name);
+                            }
+                        }
+                        
+                        if (log_f) fclose(log_f);
                         break;
                     }
                 }
+                
                 pthread_mutex_unlock(&services_lock);
+            } 
+            else if (pid == -1 && errno == ECHILD) {
+                sleep(1);
             }
-            // usleep(100000); Might be holding up the system's boot time? Maybe try a value of 10, instead. Off for testing.
         }
     }
     return NULL;
@@ -197,8 +211,6 @@ void set_service_enabled_status(Service* s, int status) {
     }
 }
 
-int stop_service_recursive(Service* s, int client_fd);
-
 // --- Dependency-Aware Execution ---
 int start_service_recursive(Service* s, int client_fd, char visited[][128], int depth) {
     if (!s->enabled) {
@@ -275,6 +287,9 @@ int start_service_recursive(Service* s, int client_fd, char visited[][128], int 
                 if (tty_fd > 2) close(tty_fd);
             }
         } else {
+            // Assign background services their own Process Group ID so the whole tree can be killed
+            setpgid(0, 0); 
+            
             char log_path[256];
             snprintf(log_path, sizeof(log_path), "%s/%s.log", journals_dir, s->name);
             int log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
@@ -335,9 +350,9 @@ int stop_service_recursive(Service* s, int client_fd) {
     }
 
     if (s->pid > 0) {
-        kill(s->pid, SIGTERM);
+        kill(-s->pid, SIGTERM); 
         usleep(300000);
-        kill(s->pid, SIGKILL);
+        kill(-s->pid, SIGKILL);
     }
 
     s->running = 0;
@@ -614,7 +629,7 @@ int main(int argc, char* argv[]) {
     }
 
     initialize_mounts();
-    verify_and_link_libraries();
+    //verify_and_link_libraries();
 
     pthread_t reaper;
     pthread_create(&reaper, NULL, start_reaper, NULL);

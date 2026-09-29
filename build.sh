@@ -1,11 +1,11 @@
 #!/bin/bash
 set -e
-# Make sure BoxedOS dir is there
+
 mkdir -p BoxedOS
-#
 WORK_DIR="BoxedOS"
 IMG="$WORK_DIR/disk.img"
-MNT="$WORK_DIR/esp_mnt"
+MNT_ESP="$WORK_DIR/esp_mnt"
+MNT_ROOT="$WORK_DIR/root_mnt"
 
 # Parse command line arguments for the --steal flag
 STEAL_CACHYOS=false
@@ -22,52 +22,59 @@ gcc -static boxd.c -o boxd -lpthread
 crystal build --release box.cr -o box
 crystal build --release networkd.cr -o networkd
 
-echo "[+] Staging Initramfs payload..."
-rm -rf initramfs_staging
-mkdir -p initramfs_staging/{bin,sbin,proc,sys,dev,etc,root}
+echo "[+] Staging binaries into slapinroot..."
+mkdir -p slapinroot/bin slapinroot/usr/bin slapinroot/services
 
-# 1. Copy the real Crystal binary as real init
-cp boxd initramfs_staging/init
-chmod +x initramfs_staging/init
+# Place boxd as the native rootfs init binary (PID 1)
+cp boxd slapinroot/init
+chmod +x slapinroot/init
 
-# 2. Copy the other crystal BoxD components
-cp box neededboot/bin/box
-cp networkd neededboot/bin/networkd
+# Place box and networkd binaries
+cp box slapinroot/usr/bin/box
+cp networkd slapinroot/bin/networkd
+chmod +x slapinroot/usr/bin/box slapinroot/bin/networkd
 
-# 3. Copy contents of ./neededboot into the root of initramfs if it exists
+# Copy neededboot contents if they exist
 if [ -d "neededboot" ]; then
-    echo "[+] Copying ./neededboot contents into initramfs root..."
-    cp -r neededboot/. initramfs_staging/
+    cp -r neededboot/. slapinroot/
 fi
 
-# 4. Copy contents of ./slapinroot into the root filesystem loaded at boot
-if [ -d "slapinroot" ]; then
-    echo "[+] Copying ./slapinroot contents into root filesystem..."
-    #cp -r slapinroot/* initramfs_staging/
-    #cp -r slapinroot/.config initramfs_staging
-    # Wasted cycles
-
-    cp -r slapinroot/. initramfs_staging/
-fi
-
-echo "[+] Packing cpio archive..."
-cd initramfs_staging
-find . -print0 | cpio --null -ov --format=newc > ../$WORK_DIR/initramfs.cpio
-cd ..
-rm -rf initramfs_staging
-
-echo "[+] Creating 128MB UEFI FAT32 disk image..."
-mkdir -p "$WORK_DIR"
+echo "[+] Creating 4GB partitioned disk image..."
 rm -f "$IMG"
-dd if=/dev/zero of="$IMG" bs=1M count=128
-mkfs.fat -F32 "$IMG"
+# 4GB to comfortably fit 2.3G slapinroot plus ESP
+dd if=/dev/zero of="$IMG" bs=1M count=4096
 
-echo "[+] Mounting disk image and installing GRUB EFI..."
-mkdir -p "$MNT"
-sudo mount "$IMG" "$MNT"
+echo "[+] Setting up GPT partition table..."
+parted -s "$IMG" mklabel gpt
+parted -s "$IMG" mkpart ESP fat32 1MiB 512MiB
+parted -s "$IMG" mkpart primary ext4 512MiB 100%
+parted -s "$IMG" set 1 esp on
 
-# Install GRUB for UEFI directly onto the FAT image (removable mode places it at EFI/BOOT/BOOTX64.EFI)
-sudo grub-install --target=x86_64-efi --efi-directory="$MNT" --boot-directory="$MNT/boot" --removable --no-nvram
+echo "[+] Setting up loop device..."
+LOOPDEV=$(sudo losetup --find --show -P "$IMG")
+
+cleanup() {
+    set +e
+    sudo umount "$MNT_ESP" 2>/dev/null || true
+    sudo umount "$MNT_ROOT" 2>/dev/null || true
+    sudo losetup -d "$LOOPDEV" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+echo "[+] Formatting partitions..."
+sudo mkfs.fat -F32 "${LOOPDEV}p1"
+sudo mkfs.ext4 -F "${LOOPDEV}p2"
+
+echo "[+] Mounting partitions..."
+mkdir -p "$MNT_ESP" "$MNT_ROOT"
+sudo mount "${LOOPDEV}p1" "$MNT_ESP"
+sudo mount "${LOOPDEV}p2" "$MNT_ROOT"
+
+echo "[+] Copying slapinroot directly into root partition..."
+sudo cp -a slapinroot/. "$MNT_ROOT/"
+
+echo "[+] Installing GRUB EFI on ESP..."
+sudo grub-install --target=x86_64-efi --efi-directory="$MNT_ESP" --boot-directory="$MNT_ESP/boot" --removable --no-nvram
 
 # Determine kernel source based on flags
 if [ "$STEAL_CACHYOS" = true ]; then
@@ -75,38 +82,40 @@ if [ "$STEAL_CACHYOS" = true ]; then
     KERNEL_SRC="/boot/vmlinuz-linux-cachyos"
     if [ ! -f "$KERNEL_SRC" ]; then
         echo "[!] Error: CachyOS kernel not found at $KERNEL_SRC"
-        sudo umount "$MNT"
-        rm -rf "$MNT"
         exit 1
     fi
 else
     echo "[+] Using default custom NewKernel..."
     KERNEL_SRC="NewKernel"
     if [ ! -f "$KERNEL_SRC" ]; then
-        echo "[!] Error: 'NewKernel' not found in project root. Did you forget to move or compile it?"
-        sudo umount "$MNT"
-        rm -rf "$MNT"
+        echo "[!] Error: 'NewKernel' not found in project root."
         exit 1
     fi
 fi
 
-echo "[+] Copying kernel ($KERNEL_SRC) and initramfs to disk image..."
-sudo cp -L "$KERNEL_SRC" "$MNT/boot/vmlinuz"
-sudo cp -L "$WORK_DIR/initramfs.cpio" "$MNT/boot/initramfs.cpio"
+echo "[+] Copying kernel to ESP..."
+sudo mkdir -p "$MNT_ESP/boot"
+sudo cp -L "$KERNEL_SRC" "$MNT_ESP/boot/vmlinuz"
+
+echo "[+] Retrieving root filesystem UUID..."
+ROOT_UUID=$(sudo blkid -s UUID -o value "${LOOPDEV}p2")
+echo "[+] Root filesystem UUID: $ROOT_UUID"
 
 echo "[+] Writing GRUB configuration..."
-sudo mkdir -p "$MNT/boot/grub"
-sudo bash -c "cat << 'EOF' > '$MNT/boot/grub/grub.cfg'
+sudo mkdir -p "$MNT_ESP/boot/grub"
+sudo bash -c "cat << 'EOF' > '$MNT_ESP/boot/grub/grub.cfg'
 set timeout=5
 set default=0
 
-menuentry \"BoxedOS (UEFI + BoxD + Custom Root)\" {
-    linux /boot/vmlinuz quiet
-    initrd /boot/initramfs.cpio
+menuentry \"BoxedOS (UEFI + BoxD + Native RootFS)\" {
+    linux /boot/vmlinuz root=/dev/vda2 init=/init rw quiet
 }
 EOF"
 
-sudo umount "$MNT"
-rm -rf "$MNT"
+echo "[+] Unmounting and cleaning up..."
+sudo umount "$MNT_ESP"
+sudo umount "$MNT_ROOT"
+sudo losetup -d "$LOOPDEV"
+trap - EXIT
 
-echo "SUCCESS! UEFI disk image ready at '$IMG' using kernel: $KERNEL_SRC."
+echo "SUCCESS! Partitioned UEFI disk image ready at '$IMG'."
