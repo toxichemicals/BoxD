@@ -55,7 +55,6 @@ echo "[+] Building BoxD components..."
 gcc -static boxd.c -o boxd -lpthread
 crystal build --release box.cr -o box
 crystal build --release networkd.cr -o networkd
-
 echo "[+] Staging binaries into slapinroot..."
 mkdir -p slapinroot/bin slapinroot/usr/bin slapinroot/services
 
@@ -64,9 +63,9 @@ cp boxd slapinroot/init
 chmod +x slapinroot/init
 
 # Place box and networkd binaries
-cp box slapinroot/usr/bin/box
+cp box slapinroot/bin/box
 cp networkd slapinroot/bin/networkd
-chmod +x slapinroot/usr/bin/box slapinroot/bin/networkd
+chmod +x slapinroot/bin/box slapinroot/bin/networkd
 
 # Copy neededboot contents if they exist
 if [ -d "neededboot" ]; then
