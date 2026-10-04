@@ -17,12 +17,12 @@ BoxD Linux is a new Linux distro featuring a base chain of it's own tools.
 * Curl
 * Fastfetch
 * Busybox
+* tapepack (package manager)
 * Probably other stuff I can't think of right now.
 
 # what will be added
-* a package manager called sail that rely's on arch repos for cutting edge software
 * adding more services for kernel modules
-* adding xfce4 with xlibre as the x11/xorg server
+* adding hyprland
 
 
 # Why should you, the user, choose this distro?
@@ -37,10 +37,23 @@ You shouldn't. Goofy-goober.
 * crystal compiler
 * glibc/gcc
 * qemu/kvm
+* bash
+* coreutils
+* util-linux
+* parted
+* dosfstools
+* e2fsprogs
+* grub
+* curl
+* tar
+* zstd
+* rsync
+* openssh
+* file
 
 
 
 # Contributors
 * t0x1ch3m1cals (Lead-Dev)
-* cyberstar (Co-dev)
+* cyberstar (Co-Dev)
 
