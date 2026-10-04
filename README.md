@@ -34,7 +34,11 @@ You shouldn't. Goofy-goober.
 * ./qemu.sh is my preset for qemu to load it.
 
 # TO-DO: Dependencies
-Don't got time for this yet!
+* crystal compiler
+* glibc/gcc
+* qemu/kvm
+
+
 
 # Contributors
 * t0x1ch3m1cals (Lead-Dev)
