@@ -1,0 +1,14 @@
+runner=boxd
+shell=/bin/bash
+exec=[inline]
+waiton=seatd
+autorestart=false
+enabled=true
+
+inline{
+mkdir -p /run/user/1000
+chmod 700 /run/user/1000
+chown -R 1000:1000 /run/user/1000
+export XDG_RUNTIME_DIR=/run/user/1000
+exec Hyprland
+}

@@ -1,0 +1,12 @@
+prefix=/home/toxichemicals/Projects/BoxD/slapinroot
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: Xaw3d
+Description: X 3D Athena Widgets Library
+Version: 1.6.6
+Requires: xproto xmu xt
+Requires.private: x11 xext
+Cflags: -I${includedir}  -DXAW_INTERNATIONALIZATION
+Libs: -L${libdir} -lXaw3d

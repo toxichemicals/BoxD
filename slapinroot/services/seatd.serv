@@ -1,0 +1,3 @@
+exec=seatd -g video
+autorestart=true
+enabled=y

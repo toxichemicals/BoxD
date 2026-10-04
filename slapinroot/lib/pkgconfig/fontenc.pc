@@ -1,0 +1,12 @@
+prefix=/home/toxichemicals/Projects/BoxD/slapinroot
+exec_prefix=${prefix}
+includedir=${prefix}/include
+libdir=${exec_prefix}/lib
+
+Name: fontenc
+Description: The fontenc Library
+URL: https://gitlab.freedesktop.org/xorg/lib/libfontenc/
+Version: 1.1.9
+Requires.private: zlib
+Libs: -L${libdir} -lfontenc
+Cflags: -I${includedir}

@@ -1,0 +1,12 @@
+prefix=/home/toxichemicals/Projects/BoxD/slapinroot
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: Xpm
+Description: X Pixmap Library
+Version: 3.5.19
+Requires: x11
+Requires.private: x11
+Cflags: -I${includedir}
+Libs: -L${libdir} -lXpm

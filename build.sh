@@ -52,20 +52,37 @@ if [ ! -d "slapinroot/lib/modules" ]; then
 fi
 
 echo "[+] Building BoxD components..."
+cd BoxdStuff/BoxD
 gcc -static boxd.c -o boxd -lpthread
 crystal build --release box.cr -o box
-crystal build --release networkd.cr -o networkd
+cd ..
+cd NetworkD
+crystal build --release networkd.cr -o network
+cd ../
+cd Tape
+cd tape
+crystal build --release tape.cr -o tape
+cd ../
+cd tapepack
+crystal build --release tapepack.cr -o tapepack
+cd ../../../
 echo "[+] Staging binaries into slapinroot..."
+#pwd # Kinda lowkey needed for debugging cuz I got confused w/ relative paths
 mkdir -p slapinroot/bin slapinroot/usr/bin slapinroot/services
 
 # Place boxd as the native rootfs init binary (PID 1)
-cp boxd slapinroot/init
+cp BoxdStuff/BoxD/boxd slapinroot/init
 chmod +x slapinroot/init
 
 # Place box and networkd binaries
-cp box slapinroot/bin/box
-cp networkd slapinroot/bin/networkd
+cp BoxdStuff/BoxD/box slapinroot/bin/box
+cp BoxdStuff/NetworkD/networkd slapinroot/bin/networkd
 chmod +x slapinroot/bin/box slapinroot/bin/networkd
+
+# Place tape stuffs
+cp BoxdStuff/Tape/tape/tape slapinroot/bin/tape
+cp BoxdStuff/Tape/tapepack/tapepack slapinroot/bin/tapepack
+chmod +x slapinroot/bin/tape slapinroot/bin/tapepack
 
 # Copy neededboot contents if they exist
 if [ -d "neededboot" ]; then

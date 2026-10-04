@@ -1,0 +1,9 @@
+prefix=/home/toxichemicals/Projects/BoxD/slapinroot
+includedir=${prefix}/include
+libdir=${prefix}/lib
+
+Name: libxcvt
+Description: A Library to generate VESA CVT standard timing modelines.
+Version: 0.1.3
+Libs: -L${libdir} -lxcvt
+Cflags: -I${includedir}
