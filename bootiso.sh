@@ -1,4 +1,6 @@
 #!/bin/bash
+echo "warning this script is not being updated and is now considered deprecated this will run anyways in 10 secs (cry abt it)"
+sleep 10
 set -e
 
 ISO_DIR="iso_build"
